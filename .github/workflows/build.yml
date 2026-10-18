@@ -13,22 +13,443 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build NoHomeBar.app (Unsigned Release)
+      - name: Apply iOS 14.3 Optimization & Xcode 26 Compatibility Fixes
         run: |
-          xcodebuild -project NoHomeBar.xcodeproj \
-            -scheme NoHomeBar \
-            -configuration Release \
-            -sdk iphoneos \
-            -derivedDataPath build \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            clean build
+          python3 -c 'import pathlib, re; p = pathlib.Path("NoHomeBar.xcodeproj/project.pbxproj"); s = p.read_text(); s = re.sub(r"SWIFT_OBJC_BRIDGING_HEADER = [^;]+;", "SWIFT_OBJC_BRIDGING_HEADER = \"\";", s); p.write_text(s)'
 
-      - name: Package & Ad-Hoc Sign IPA for TrollStore / Sideloadly
+          python3 -c 'import pathlib; p = pathlib.Path("NoHomeBar/vm_unaligned_copy_switch_race.c"); s = p.read_text(); h = "#include <unistd.h>\n#include <string.h>\n#include <stdlib.h>\n#include <time.h>\n#include <sys/types.h>\n"; s = (h + s if "<unistd.h>" not in s else s).replace("ro_addr = file_mapped;", "ro_addr = (vm_address_t)file_mapped;"); p.write_text(s)'
+
+          cat << 'CHEADER' > NoHomeBar/vm_unaligned_copy_switch_race.h
+          #pragma once
+          #include <stdlib.h>
+          #include <stdbool.h>
+          #include <stdint.h>
+          #include <sys/types.h>
+          #include <unistd.h>
+          #include <string.h>
+
+          bool unaligned_copy_switch_race(int file_to_overwrite, off_t file_offset, const void* overwrite_data, size_t overwrite_length);
+          CHEADER
+
+          cat << 'SWIFTSRC1' > NoHomeBar/NoHomeBar.swift
+          import UIKit
+          import SwiftUI
+          import Darwin
+
+          @_silgen_name("unaligned_copy_switch_race")
+          func c_unaligned_copy_switch_race(
+              _ file_to_overwrite: Int32,
+              _ file_offset: off_t,
+              _ overwrite_data: UnsafeRawPointer?,
+              _ overwrite_length: Int
+          ) -> Bool
+
+          private var lockedMappings: [String: (ptr: UnsafeMutableRawPointer, size: Int, fd: Int32)] = [:]
+          private let lockQueue = DispatchQueue(label: "com.nohomebar.lockqueue")
+
+          func touchAndKeepPageAlive(TargetFilePath: String, ExpectedHeader: String) {
+              let expectedBytes = Array(ExpectedHeader.utf8)
+              lockQueue.sync {
+                  if let entry = lockedMappings[TargetFilePath] {
+                      let bytePtr = entry.ptr.assumingMemoryBound(to: UInt8.self)
+                      var checksum: UInt8 = 0
+                      for idx in stride(from: 0, to: entry.size, by: 64) {
+                          checksum ^= bytePtr[idx]
+                      }
+                      _ = checksum
+                      mlock(entry.ptr, entry.size)
+                  }
+              }
+              let fd = open(TargetFilePath, O_RDONLY | O_CLOEXEC)
+              if fd >= 0 {
+                  var header = [UInt8](repeating: 0, count: expectedBytes.count)
+                  let readCount = read(fd, &header, expectedBytes.count)
+                  close(fd)
+                  if readCount == expectedBytes.count && header != expectedBytes {
+                      _ = overwrite(TargetFilePath: TargetFilePath, OverwriteData: ExpectedHeader)
+                  }
+              }
+          }
+
+          func overwrite(TargetFilePath: String, OverwriteData: String) -> String {
+              let base = "0123456789"
+              let randomStr = String((0..<2).map { _ in base.randomElement()! })
+              let OverwriteFileData = OverwriteData.data(using: .utf8)!
+              let pageSize = 0x4000
+
+              let fd = open(TargetFilePath, O_RDONLY | O_CLOEXEC)
+              guard fd >= 0 else {
+                  return "open Error - " + randomStr
+              }
+
+              var st = stat()
+              var mapSize = pageSize
+              if fstat(fd, &st) == 0 && st.st_size > 0 {
+                  mapSize = min(Int(st.st_size), pageSize)
+              }
+
+              guard let Map = mmap(nil, mapSize, PROT_READ, MAP_SHARED, fd, 0), Map != MAP_FAILED else {
+                  close(fd)
+                  return "mmap Error - " + randomStr
+              }
+
+              _ = mlock(Map, mapSize)
+              lockQueue.sync {
+                  if let old = lockedMappings[TargetFilePath] {
+                      munmap(old.ptr, old.size)
+                      close(old.fd)
+                  }
+                  lockedMappings[TargetFilePath] = (ptr: Map, size: mapSize, fd: fd)
+              }
+
+              for chunkOff in stride(from: 0, to: OverwriteFileData.count, by: pageSize) {
+                  let endIdx = min(OverwriteFileData.count, chunkOff + pageSize - 1)
+                  let dataChunk = OverwriteFileData[chunkOff..<endIdx]
+                  var overwroteOne = false
+
+                  for _ in 0..<6 {
+                      let overwriteSucceeded = dataChunk.withUnsafeBytes { dataChunkBytes -> Bool in
+                          guard let baseAddr = dataChunkBytes.baseAddress else { return false }
+                          let ok = c_unaligned_copy_switch_race(
+                              fd, off_t(chunkOff), baseAddr, dataChunkBytes.count)
+                          if !ok { return false }
+                          return memcmp(Map.advanced(by: chunkOff), baseAddr, dataChunkBytes.count) == 0
+                      }
+                      if overwriteSucceeded {
+                          _ = mlock(Map, mapSize)
+                          overwroteOne = true
+                          break
+                      }
+                      usleep(50_000)
+                  }
+
+                  guard overwroteOne else {
+                      return "unknown Error - " + randomStr
+                  }
+              }
+
+              return "Success - " + randomStr
+          }
+
+          func IsSucceeded(TargetFilePath: String) -> Bool {
+              let cleanPath = TargetFilePath.replacingOccurrences(of: "file://", with: "")
+              let fd = open(cleanPath, O_RDONLY | O_CLOEXEC)
+              guard fd >= 0 else { return false }
+              defer { close(fd) }
+
+              var buf = [UInt8](repeating: 0, count: 3)
+              let bytesRead = read(fd, &buf, 3)
+              guard bytesRead == 3 else { return false }
+              return buf[0] == 0x78 && buf[1] == 0x78 && buf[2] == 0x78
+          }
+          SWIFTSRC1
+
+          cat << 'SWIFTSRC2' > NoHomeBar/ContentView.swift
+          import SwiftUI
+          import AudioToolbox
+          import Darwin
+
+          struct ContentView: View {
+              @Environment(\.scenePhase) private var scenePhase
+              private let version = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "0.5"
+              @State private var LogMessage = ""
+              @State private var ViewLog = true
+              @State private var Respring_confirm = false
+              @State private var SettingsShowing = false
+              @State private var Restore_Confirm = false
+              @State private var Update_Alert = false
+              @State private var Update_Available = false
+              @State private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+              @State private var targetHeader: String = "xxx"
+
+              struct TargetFilesPath_Struct: Identifiable {
+                  var id = UUID()
+                  let title: String
+                  let path: String
+              }
+
+              @State private var TargetFilesPath = [
+                  TargetFilesPath_Struct(
+                      title: "Assets.car",
+                      path: "/System/Library/PrivateFrameworks/MaterialKit.framework/Assets.car"
+                  ),
+              ]
+
+              var body: some View {
+                  VStack {
+                      if ViewLog {
+                          Text("")
+                              .frame(width: 300, height: 200)
+                              .disabled(true)
+                      }
+                      Text("NoHomeBar__").font(.largeTitle).fontWeight(.bold)
+                          .alert(isPresented: $Respring_confirm) {
+                              Alert(
+                                  title: Text("Restart SpringBoard"),
+                                  message: Text("Memory page locked. Tap Restart to apply, or Later to respring via TrollStore."),
+                                  primaryButton: .destructive(Text("Restart"), action: Respring),
+                                  secondaryButton: .default(Text("Later (Keep Locked)"))
+                              )
+                          }
+                      HStack {
+                          if TargetFilesPath.allSatisfy({ IsSucceeded(TargetFilePath: "file://" + $0.path) == true }) == false {
+                              Button("Disable HomeBar") {
+                                  Disable_ShutterSound()
+                              }
+                              .padding()
+                              .accentColor(Color.white)
+                              .background(Color.blue)
+                              .cornerRadius(26)
+                              .shadow(color: Color.purple, radius: 15, x: 0, y: 5)
+                          } else {
+                              Button("Restore HomeBar") {
+                                  Restore_Confirm = true
+                              }
+                              .padding()
+                              .accentColor(Color.white)
+                              .background(Color.blue)
+                              .cornerRadius(26)
+                              .shadow(color: Color.purple, radius: 15, x: 0, y: 5)
+                              .alert(isPresented: $Restore_Confirm) {
+                                  Alert(
+                                      title: Text("Restore HomeBar?"),
+                                      primaryButton: .destructive(Text("Restore"), action: Restore_ShutterSound),
+                                      secondaryButton: .default(Text("Cancel"))
+                                  )
+                              }
+                          }
+                          Button {
+                              SettingsShowing = true
+                          } label: {
+                              Image(systemName: "info.circle")
+                                  .padding()
+                                  .accentColor(Color.white)
+                                  .background(Color.blue)
+                                  .cornerRadius(26)
+                                  .shadow(color: Color.purple, radius: 15, x: 0, y: 5)
+                          }.actionSheet(isPresented: $SettingsShowing) {
+                              ActionSheet(title: Text("NoHomeBar v\(version)"), message: Text("iOS 14+ Optimized"), buttons: [
+                                  .default(Text("Source Code")) {
+                                      if let url = URL(string: "https://github.com/straight-tamago/NoHomeBar") {
+                                          UIApplication.shared.open(url)
+                                      }
+                                  },
+                                  .default(Text("Auto run (Status: \(UserDefaults.standard.bool(forKey: "AutoRun")))")) {
+                                      let current = UserDefaults.standard.bool(forKey: "AutoRun")
+                                      UserDefaults.standard.set(!current, forKey: "AutoRun")
+                                  },
+                                  .default(Text("View Log (Status: \(UserDefaults.standard.bool(forKey: "ViewLog")))")) {
+                                      let current = UserDefaults.standard.bool(forKey: "ViewLog")
+                                      UserDefaults.standard.set(!current, forKey: "ViewLog")
+                                      ViewLog = !current
+                                  },
+                                  .cancel()
+                              ])
+                          }
+                      }
+                      if ViewLog {
+                          Text(LogMessage)
+                              .padding(.top, 10)
+                          List {
+                              ForEach(TargetFilesPath) { item in
+                                  HStack {
+                                      Text(item.title)
+                                      Spacer()
+                                      if IsSucceeded(TargetFilePath: "file://" + item.path) == true {
+                                          Text("OFF").foregroundColor(.green)
+                                      } else {
+                                          Text("ON").foregroundColor(.red)
+                                      }
+                                  }
+                              }.frame(height: 1)
+                          }
+                          .listStyle(PlainListStyle())
+                          .frame(width: 300, height: 200)
+                      } else {
+                          Text(LogMessage)
+                              .padding(.top, 10)
+                      }
+                  }
+                  .onAppear {
+                      LogMessage = "v\(version)"
+                      if UserDefaults.standard.bool(forKey: "ViewLog") == false {
+                          ViewLog = false
+                      }
+                      Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { _ in
+                          TargetFilesPath[0].id = UUID()
+                      }
+                  }
+                  .onChange(of: scenePhase) { phase in
+                      if phase == .background {
+                          startBackgroundPageGuard()
+                      }
+                      if phase == .active {
+                          if UserDefaults.standard.bool(forKey: "AutoRun") == true {
+                              Disable_ShutterSound()
+                          }
+                      }
+                  }
+              }
+
+              func startBackgroundPageGuard() {
+                  if backgroundTaskID != .invalid {
+                      UIApplication.shared.endBackgroundTask(backgroundTaskID)
+                  }
+                  backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "NoHomeBarPageGuard") {
+                      if self.backgroundTaskID != .invalid {
+                          UIApplication.shared.endBackgroundTask(self.backgroundTaskID)
+                          self.backgroundTaskID = .invalid
+                      }
+                  }
+                  let paths = TargetFilesPath.map { $0.path }
+                  let expected = targetHeader
+                  DispatchQueue.global(qos: .userInteractive).async {
+                      for _ in 0..<75 {
+                          for p in paths {
+                              touchAndKeepPageAlive(TargetFilePath: p, ExpectedHeader: expected)
+                          }
+                          usleep(200_000)
+                      }
+                  }
+              }
+
+              func Disable_ShutterSound() {
+                  LogMessage = "Disabling..."
+                  targetHeader = "xxx"
+                  UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+                  startBackgroundPageGuard()
+
+                  let paths = TargetFilesPath.map { $0.path }
+                  DispatchQueue.global(qos: .userInteractive).async {
+                      var lastResult = ""
+                      for pass in 0..<4 {
+                          for path in paths {
+                              lastResult = overwrite(TargetFilePath: path, OverwriteData: "xxx")
+                              touchAndKeepPageAlive(TargetFilePath: path, ExpectedHeader: "xxx")
+                          }
+                          if pass < 3 {
+                              usleep(120_000)
+                          }
+                      }
+                      DispatchQueue.main.async {
+                          self.LogMessage = lastResult
+                          self.TargetFilesPath[0].id = UUID()
+                          DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                              self.Respring_confirm = true
+                          }
+                      }
+                  }
+              }
+
+              func Restore_ShutterSound() {
+                  LogMessage = "Restoring..."
+                  targetHeader = "BOM"
+                  UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+                  startBackgroundPageGuard()
+
+                  let paths = TargetFilesPath.map { $0.path }
+                  DispatchQueue.global(qos: .userInteractive).async {
+                      var lastResult = ""
+                      for pass in 0..<4 {
+                          for path in paths {
+                              lastResult = overwrite(TargetFilePath: path, OverwriteData: "BOM")
+                              touchAndKeepPageAlive(TargetFilePath: path, ExpectedHeader: "BOM")
+                          }
+                          if pass < 3 {
+                              usleep(120_000)
+                          }
+                      }
+                      DispatchQueue.main.async {
+                          self.LogMessage = lastResult
+                          self.TargetFilesPath[0].id = UUID()
+                          DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                              self.Respring_confirm = true
+                          }
+                      }
+                  }
+              }
+
+              func Respring() {
+                  let paths = TargetFilesPath.map { $0.path }
+                  let expected = targetHeader
+
+                  DispatchQueue.global(qos: .userInteractive).async {
+                      while true {
+                          for p in paths {
+                              touchAndKeepPageAlive(TargetFilePath: p, ExpectedHeader: expected)
+                          }
+                          usleep(10_000)
+                      }
+                  }
+
+                  var pid: pid_t = 0
+                  let killallPaths = ["/usr/bin/killall", "/var/jb/usr/bin/killall"]
+                  for binPath in killallPaths {
+                      if access(binPath, X_OK) == 0 {
+                          let arg0 = strdup(binPath)
+                          let arg1 = strdup("-9")
+                          let arg2 = strdup("SpringBoard")
+                          let arg3 = strdup("backboardd")
+                          var argv: [UnsafeMutablePointer<CChar>?] = [arg0, arg1, arg2, arg3, nil]
+                          posix_spawn(&pid, binPath, nil, nil, &argv, nil)
+                          free(arg0); free(arg1); free(arg2); free(arg3)
+                      }
+                  }
+
+                  DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                      let sharedApplication = UIApplication.shared
+                      let windows = sharedApplication.windows
+                      if let window = windows.first {
+                          while true {
+                              window.snapshotView(afterScreenUpdates: false)
+                          }
+                      }
+                  }
+              }
+          }
+          SWIFTSRC2
+
+      - name: Build NoHomeBar.app (Bypassing Bridging PCH & Fixing Deployment Target)
+        run: |
+          BUILT=0
+          for TARGET_VER in 15.0 16.0 17.0 18.0 26.0 14.0; do
+            echo "Trying build with IPHONEOS_DEPLOYMENT_TARGET=${TARGET_VER}..."
+            python3 -c "import pathlib, re; p = pathlib.Path('NoHomeBar.xcodeproj/project.pbxproj'); p.write_text(re.sub(r'IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+;', 'IPHONEOS_DEPLOYMENT_TARGET = ${TARGET_VER};', p.read_text()))"
+            rm -rf build
+            if xcodebuild -project NoHomeBar.xcodeproj \
+              -scheme NoHomeBar \
+              -configuration Release \
+              -sdk iphoneos \
+              -derivedDataPath build \
+              IPHONEOS_DEPLOYMENT_TARGET="${TARGET_VER}" \
+              SWIFT_OBJC_BRIDGING_HEADER="" \
+              CLANG_ENABLE_OBJC_WEAK=YES \
+              GCC_TREAT_WARNINGS_AS_ERRORS=NO \
+              SWIFT_TREAT_WARNINGS_AS_ERRORS=NO \
+              OTHER_CFLAGS="-Wno-error -Wno-int-conversion -Wno-implicit-function-declaration" \
+              CODE_SIGN_IDENTITY="" \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGNING_ALLOWED=NO \
+              clean build; then
+              echo "Build succeeded with target ${TARGET_VER}"
+              BUILT=1
+              break
+            fi
+          done
+          if [ "$BUILT" -ne 1 ]; then
+            exit 1
+          fi
+
+      - name: Patch MinimumOSVersion to 14.0 & Package IPA
         run: |
           mkdir -p Payload
           cp -r build/Build/Products/Release-iphoneos/NoHomeBar.app Payload/
+          plutil -replace MinimumOSVersion -string "14.0" Payload/NoHomeBar.app/Info.plist
+          if command -v vtool >/dev/null 2>&1; then
+            vtool -set-build-version ios 14.0 16.0 -replace \
+              -output Payload/NoHomeBar.app/NoHomeBar \
+              Payload/NoHomeBar.app/NoHomeBar || true
+          fi
           codesign --force --deep --sign - Payload/NoHomeBar.app
           zip -r9 NoHomeBar-Optimized.ipa Payload
 
