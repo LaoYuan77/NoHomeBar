@@ -1,0 +1,39 @@
+name: Build NoHomeBar IPA
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-ipa:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build NoHomeBar.app (Unsigned Release)
+        run: |
+          xcodebuild -project NoHomeBar.xcodeproj \
+            -scheme NoHomeBar \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            clean build
+
+      - name: Package & Ad-Hoc Sign IPA for TrollStore / Sideloadly
+        run: |
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/NoHomeBar.app Payload/
+          codesign --force --deep --sign - Payload/NoHomeBar.app
+          zip -r9 NoHomeBar-Optimized.ipa Payload
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NoHomeBar-Optimized-IPA
+          path: NoHomeBar-Optimized.ipa
